@@ -1,0 +1,150 @@
+Ok awesome, I have some code i want you help me to change.
+On the big picture. I want to apply shift parallelism in this repo. 
+It showed as : 
+For example it start with 8 local gpus, there are few execusion steps; 
+    1. At beginning it have 8 gpu work on dp. 
+    2. Later when the utilization is low we shift to 4dp * 2tp 
+    3. Later we shift again to 8tp
+
+But that's the big picture. And right now WE ONLY FOUCS ON THE FIRST STEP 8 DP. 
+vllm does support dp in natural. but it will init nun_dp scheduler which create problem in the future. and they run in embarrassingl parallelism
+So here we want just one Scheduler manage the DP at beginning, and later it can be changed. 
+Here are some implementation I discussed with Claude opus4.6 as reference. 
+
+Please review that carefully and give me an updated implementation.idea file in current folder 
+And if you have any questions please listen them in this file. 
+
+Here are the implementation plan: 
+
+# Implementation Plan: `context_parallel_all_dp` Mode for ArcticInference
+
+## Overview
+
+Rename `enable_context_parallel` → `enable_context_parallel_all_dp` across the codebase. This mode makes 1 vLLM instance manage N GPUs as N independent DP workers (each running the full model, each processing a subset of requests), instead of N separate vLLM instances.
+
+**Key architectural difference from existing Ulysses SP:**
+- Ulysses SP: all workers process the SAME requests (sequence split across workers, heads split, all-to-all in attention)
+- `context_parallel_all_dp`: each worker processes DIFFERENT requests (request-level partitioning, no all-to-all needed, outputs merged in executor)
+
+---
+
+## File-by-File Changes
+
+### 1. `arctic_inference/vllm/config.py`
+
+**`ArcticParallelConfig`**
+- Rename field `enable_context_parallel: bool` → `enable_context_parallel_all_dp: bool`
+- Update the `__post_init__` validation to reference the new name
+- Add a new property `context_parallel_all_dp_size` that returns `ulysses_sequence_parallel_size` when `enable_context_parallel_all_dp` is True, else 1
+
+**`VllmConfigPatch.__str__`**
+- Rename the printed field from `enable_context_parallel` → `enable_context_parallel_all_dp`
+
+### 2. `arctic_inference/vllm/args.py`
+
+**`ArcticArgs`**
+- Rename field `enable_context_parallel` → `enable_context_parallel_all_dp`
+
+**`EngineArgsPatch.add_cli_args`**
+- Rename CLI flag `--enable-context-parallel` → `--enable-context-parallel-all-dp`
+- Update help text to describe the DP behavior
+
+**`EngineArgsPatch.create_engine_config`**
+- Rename the kwargs key from `enable_context_parallel` → `enable_context_parallel_all_dp`
+
+### 3. `arctic_inference/vllm/ulysses.py`
+
+This is the **most complex file** — contains the executor, parallel state, attention, and engine core patches.
+
+#### `UlyssesModelConfig`
+- **`get_num_kv_heads()`** — rename `enable_context_parallel` check → `enable_context_parallel_all_dp`
+- **`get_num_attention_heads()`** — same rename
+
+#### `UlyssesAttention`
+- **`__init__()`** — rename `self.enable_context_parallel` → `self.enable_context_parallel_all_dp`
+- **`forward()`** — rename the guard check
+
+#### `UlyssesMultiprocExecutor`
+- **`_init_executor()`** — no change needed (already spawns `world_size = TP * SP * PP` workers)
+- **Add `execute_model()` override** — when `enable_context_parallel_all_dp` is True:
+  - Set `unique_reply_rank=None` (collect outputs from ALL workers)
+  - Merge the list of `ModelRunnerOutput` objects into a single combined `ModelRunnerOutput`
+- **Add `sample_tokens()` override** — same pattern: collect from all, merge
+- **Add `_merge_cp_outputs(outputs: list) -> ModelRunnerOutput`** helper — concatenates `req_ids`, `sampled_token_ids`, `logprobs`, `prompt_logprobs_dict`, `req_id_to_index` from all worker outputs into one
+
+#### `UlyssesParallelState.initialize_model_parallel()`
+- No structural change needed. When `enable_context_parallel_all_dp=True`, the SP group is still created but the all-to-all in Attention is skipped (existing behavior). The SP group can be repurposed for DP padding sync.
+
+### 4. `arctic_inference/vllm/model_runner.py`
+
+This is the **core DP request partitioning** logic.
+
+#### `GPUModelRunnerPatch.__init__()`
+- Store `self.cp_all_dp_enabled`, `self.cp_all_dp_size`, `self.cp_all_dp_rank` by reading from `parallel_config.enable_context_parallel_all_dp` and `parallel_state._SP.rank_in_group` / `parallel_state._SP.world_size`
+
+#### Add new method: `_filter_scheduler_output_for_cp_dp(scheduler_output) -> SchedulerOutput`
+- Called at the top of `execute_model()` when `cp_all_dp_enabled` is True
+- Filters `scheduler_output.scheduled_new_reqs` — keep only those where `hash(req_id) % cp_all_dp_size == cp_all_dp_rank`
+- Filters `scheduler_output.scheduled_cached_reqs` — same rule
+- Filters `scheduler_output.scheduled_running_reqs` — same rule
+- Filters `scheduler_output.num_scheduled_tokens` — keep only this rank's req_ids
+- Recalculates `scheduler_output.total_num_scheduled_tokens`
+- Filters `scheduler_output.finished_req_ids` — only the ones this rank was tracking
+
+#### `GPUModelRunnerPatch.execute_model()` override
+- At the top (before calling `_orig_execute_model`), if `cp_all_dp_enabled`:
+  - Call `self._filter_scheduler_output_for_cp_dp(scheduler_output)` to create a filtered copy
+  - Pass the filtered copy to `_orig_execute_model`
+- The rest of the pipeline (`update_states`, `prepare_inputs`, model forward, sampling) will naturally only process this rank's requests since the `SchedulerOutput` has been filtered
+
+### 5. `arctic_inference/vllm/patches.py`
+
+**`apply_arctic_patches()`**
+- No new patches to register (all changes are within existing patch classes)
+
+### 6. New file: `arctic_inference/vllm/cp_all_dp.py` (optional, for cleanliness)
+
+If the merge/filter logic is complex enough, extract it into a dedicated module:
+- `filter_scheduler_output(scheduler_output, rank, world_size) -> SchedulerOutput`
+- `merge_model_runner_outputs(outputs: list[ModelRunnerOutput]) -> ModelRunnerOutput`
+
+---
+
+## Execution Flow Summary
+
+```
+User: --ulysses-sequence-parallel-size 8 --enable-context-parallel-all-dp
+
+1. EngineCore creates 1 Scheduler + 1 MultiprocExecutor (8 workers)
+2. Scheduler.schedule() → SchedulerOutput with ALL 8+ requests
+3. Executor broadcasts SAME SchedulerOutput to ALL 8 workers
+4. Each worker:
+   a. _filter_scheduler_output_for_cp_dp() → keeps only req_id % 8 == my_rank
+   b. update_states() with filtered requests
+   c. prepare_inputs() with filtered requests
+   d. model() forward (full model, no all-to-all)
+   e. sample() → ModelRunnerOutput for my subset
+5. Executor collects 8 ModelRunnerOutputs, merges into 1
+6. Scheduler.update_from_output() processes merged output (all requests present)
+```
+
+---
+
+## Key Design Decisions
+
+| Decision | Choice | Rationale |
+|----------|--------|-----------|
+| Where to filter requests | `execute_model()` in model_runner (filter SchedulerOutput before processing) | Minimal changes — `update_states`/`prepare_inputs`/sampling all work unchanged |
+| Where to merge outputs | `execute_model()` / `sample_tokens()` in executor (override in `UlyssesMultiprocExecutor`) | Scheduler expects a single merged `ModelRunnerOutput` |
+| Request assignment | `hash(req_id) % cp_all_dp_size == cp_all_dp_rank` | Deterministic, stateless, no coordination needed |
+| DP padding sync | Reuse existing SP NCCL group for `get_batch_metadata_across_dp` | The SP group already connects the workers that need to sync |
+| Output collection | Remove `unique_reply_rank` so all workers respond | Each worker has different data; must collect all |
+
+---
+
+## Testing Plan
+
+1. **Unit test**: Verify `_filter_scheduler_output_for_cp_dp` correctly partitions requests
+2. **Unit test**: Verify `_merge_cp_outputs` correctly combines outputs
+3. **Integration test**: Run with `--ulysses-sequence-parallel-size 2 --enable-context-parallel-all-dp` on 2 GPUs, verify correctness against single-GPU baseline
+4. **Benchmark**: Compare throughput of 8×DP (8 vLLM instances) vs 1×CP-all-DP (1 instance, 8 workers)

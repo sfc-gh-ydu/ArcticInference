@@ -1,0 +1,55 @@
+Implement enable_gearing_parallel as DP mode
+===========================================
+
+Decisions applied
+-----------------
+- Rename flag to `enable_gearing_parallel`.
+- Use `enable_gearing_parallel` for DP behavior (different requests per rank).
+- Use Python assignment rule exactly: `hash(req_id) % cp_size == cp_rank`.
+
+Code changes
+------------
+1) arctic_inference/vllm/args.py
+- Updated CLI flag to `--enable-gearing-parallel` and help text to describe DP sharding + executor merge behavior.
+
+2) arctic_inference/vllm/config.py
+- Added `ArcticParallelConfig.gearing_parallel_size` property:
+  - returns `ulysses_sequence_parallel_size` when `enable_gearing_parallel` is true
+  - returns 1 otherwise
+
+3) arctic_inference/vllm/ulysses.py
+- Extended `UlyssesMultiprocExecutor` with:
+  - `_CPAllDPOutputAggregator` to integrate with `collective_rpc`.
+  - `_merge_cp_outputs(outputs)` to combine per-rank `ModelRunnerOutput`s into one:
+    - merges `req_ids`
+    - rebuilds `req_id_to_index`
+    - merges `sampled_token_ids`, `logprobs`, `prompt_logprobs_dict`
+    - sums `num_nans_in_logits`
+    - forwards `_actual_draft_lens` metadata if present
+  - `execute_model(...)` override:
+    - normal path unchanged when flag is off
+    - when flag is on, sets `unique_reply_rank=None` and merges all worker outputs
+  - `sample_tokens(...)` override with the same all-worker merge behavior
+
+4) arctic_inference/vllm/model_runner.py
+- In `GPUModelRunnerPatch.__init__`, added:
+  - `cp_all_dp_enabled`
+  - `cp_all_dp_size`
+  - `cp_all_dp_rank`
+  - `_cp_all_dp_owned_req_ids` tracking set
+- In `execute_model(...)`, added pre-filter step:
+  - `scheduler_output = _filter_scheduler_output_for_cp_dp(...)` when DP mode is enabled
+- Added `_filter_scheduler_output_for_cp_dp(...)`:
+  - shallow-copies scheduler output
+  - filters `scheduled_new_reqs` and `scheduled_cached_reqs` by rank ownership
+  - conditionally filters `scheduled_running_reqs` when field exists
+  - filters `num_scheduled_tokens` and recomputes `total_num_scheduled_tokens`
+  - filters `finished_req_ids` using owned-ids tracking plus hash fallback
+  - filters `scheduled_spec_decode_tokens`, `scheduled_encoder_inputs`
+  - filters `pending_structured_output_tokens` (if dict)
+  - filters `preempted_req_ids`
+
+Notes
+-----
+- This is intentionally first-step DP only under one scheduler.
+- Existing attention/model-config gating on `enable_gearing_parallel` remains active (skip all-to-all path).

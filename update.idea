@@ -1,0 +1,94 @@
+Update Log
+==========
+
+Date: 2026-02-25
+Scope: Implement `enable_context_parallel` as DP mode (single scheduler, request sharding across SP workers).
+
+What was implemented
+--------------------
+- Kept flag name unchanged: `enable_context_parallel`.
+- Updated CLI help semantics in `arctic_inference/vllm/args.py`.
+- Added `context_parallel_size` property in `arctic_inference/vllm/config.py`.
+- Added all-worker output merge in `UlyssesMultiprocExecutor`:
+  - `execute_model(...)` and `sample_tokens(...)` now collect from all workers when CP mode is enabled.
+  - merged output is returned as one `ModelRunnerOutput`.
+- Added rank-local scheduler output filtering in `GPUModelRunnerPatch`:
+  - shard rule: `hash(req_id) % cp_size == cp_rank`
+  - filtered fields include scheduled request lists, token maps, finished ids, and related per-request metadata.
+
+Changed files
+-------------
+- `arctic_inference/vllm/args.py`
+- `arctic_inference/vllm/config.py`
+- `arctic_inference/vllm/ulysses.py`
+- `arctic_inference/vllm/model_runner.py`
+
+Known follow-up checks
+---------------------
+- Run runtime validation after local editable install:
+  - 2-GPU functional parity run with `--ulysses-sequence-parallel-size 2 --enable-gearing-parallel`.
+  - Verify scheduler receives merged outputs for all assigned requests.
+  - Verify `finished_req_ids` and spec metadata handling under async scheduling.
+
+Update: rename context -> gearing
+---------------------------------
+- Renamed runtime config key:
+  - `enable_context_parallel` -> `enable_gearing_parallel`
+- Renamed size property:
+  - `context_parallel_size` -> `gearing_parallel_size`
+- Renamed CLI flag:
+  - `--enable-context-parallel` -> `--enable-gearing-parallel`
+- Updated runtime checks in:
+  - `arctic_inference/vllm/ulysses.py`
+  - `arctic_inference/vllm/model_runner.py`
+- Added startup log line in Ulysses parallel-state printout:
+  - `DGP <size> ranks <...>`
+  - where DGP (Data Gearing Parallel) maps to SP-group workers when enabled.
+
+Update: per-rank DGP debug prints
+---------------------------------
+- Located print origins:
+  - `N ..., N_ulysses ...` in `GPUModelRunnerPatch.monkeypatch_forward()`
+  - `iteration ..., running ...` in `UlyssesEngineCore.step_with_batch_queue()`
+- Added per-rank prints for DGP mode in `model_runner.py`:
+  - Forward slice print per worker rank:
+    - `[DGP rank r/s] N <...>, N_ulysses <...>, slice=[start:end]`
+  - Scheduler filtering summary per worker rank:
+    - `[DGP rank r/s] scheduled_reqs=<...>, scheduled_tokens=<...>, finished_reqs=<...>`
+
+Update: fix CachedRequestData filtering crash
+---------------------------------------------
+- Root cause: in vLLM v1, `SchedulerOutput.scheduled_cached_reqs` is a
+  `CachedRequestData` object, not an iterable list.
+- Symptom observed:
+  - `TypeError: 'CachedRequestData' object is not iterable`
+  - thrown in `_filter_scheduler_output_for_cp_dp(...)`.
+- Fix in `arctic_inference/vllm/model_runner.py`:
+  - added `_filter_cached_reqs(...)` path for `CachedRequestData`
+  - filters `req_ids` and aligned arrays/maps (`new_token_ids`, `new_block_ids`,
+    `num_computed_tokens`, `num_output_tokens`, `all_token_ids`, `resumed_req_ids`)
+  - preserves fallback behavior for list-like cached entry shapes.
+
+Update: disable Ulysses forward slicing in DGP mode
+---------------------------------------------------
+- Observation: logs showed Ulysses token-slice prints (`N`, `N_ulysses`, `slice=...`)
+  in DGP runs, which is not desired for request-sharded DGP execution.
+- Fix in `arctic_inference/vllm/model_runner.py`:
+  - `monkeypatch_forward()` now returns immediately when
+    `enable_gearing_parallel=True`.
+  - `load_model()` no longer applies `monkeypatch_forward()` when
+    `enable_gearing_parallel=True`.
+- Result: DGP mode keeps request-level sharding only and avoids Ulysses
+  tensor slicing/all-gather behavior in forward.
+
+Update: DGP stability follow-up fixes
+-------------------------------------
+- Renamed DGP index selector to explicit helper:
+  - `dgp_find_indices(req_ids)` in scheduler filtering logic.
+- Hardened `CachedRequestData` projection:
+  - fields are now projected only when list length matches `req_ids` length
+  - avoids index errors for optional PP-dependent fields (e.g. `new_token_ids`)
+    that can be empty while `req_ids` is non-empty.
+- Fixed merged output nan accounting in executor:
+  - `num_nans_in_logits` is merged as `dict[str, int]` per request
+  - removed invalid scalar cast (`int(dict)`), which caused merge-time failure.

@@ -32,7 +32,7 @@ class ArcticArgs:
     ulysses_sequence_parallel_size: int = 1
     enable_shift_parallel: bool = False
     shift_parallel_threshold: int = 512
-    enable_context_parallel: bool = False
+    enable_gearing_parallel: bool = False
 
 
 @dataclass
@@ -95,11 +95,12 @@ class EngineArgsPatch(ArcticPatch[EngineArgs]):
                   "otherwise tensor parallel across the whole world size"),
         )
         arctic_group.add_argument(
-            "--enable-context-parallel",
+            "--enable-gearing-parallel",
             action='store_true',
-            help=('If True, skip all-to-all in Ulysses attention '
-                  '(each GPU runs independent attention on its local '
-                  'sequence chunk).'),
+            help=('If True, run Data Gearing Parallel using Ulysses SP workers '
+                  'as request-level DP '
+                  'workers (one scheduler, per-rank request sharding, '
+                  'outputs merged in executor).'),
         )
         return parser
 
@@ -130,7 +131,7 @@ class EngineArgsPatch(ArcticPatch[EngineArgs]):
             self.ulysses_sequence_parallel_size)
         kwargs["enable_shift_parallel"] = self.enable_shift_parallel
         kwargs["shift_parallel_threshold"] = self.shift_parallel_threshold
-        kwargs["enable_context_parallel"] = self.enable_context_parallel
+        kwargs["enable_gearing_parallel"] = self.enable_gearing_parallel
         vllm_config.parallel_config = ArcticParallelConfig(**kwargs)
         return vllm_config
 

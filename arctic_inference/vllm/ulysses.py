@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from concurrent.futures import Future
 from collections import deque
 from collections.abc import Callable
-from typing import Optional, cast
+from typing import Any, Optional, cast
 import time
 
 import torch
@@ -71,7 +71,7 @@ class UlyssesModelConfig(ArcticPatch[ModelConfig]):
     def get_num_kv_heads(self: ModelConfig,
                          parallel_config: ParallelConfig) -> int:
         num_kv_heads = self._orig_get_num_kv_heads(parallel_config)
-        if getattr(parallel_config, 'enable_context_parallel', False):
+        if getattr(parallel_config, 'enable_gearing_parallel', False):
             return num_kv_heads
         sp_size = parallel_config.ulysses_sequence_parallel_size
         return max(1, num_kv_heads // sp_size)
@@ -79,7 +79,7 @@ class UlyssesModelConfig(ArcticPatch[ModelConfig]):
     def get_num_attention_heads(self: ModelConfig,
                                 parallel_config: ParallelConfig) -> int:
         num_heads = self._orig_get_num_attention_heads(parallel_config)
-        if getattr(parallel_config, 'enable_context_parallel', False):
+        if getattr(parallel_config, 'enable_gearing_parallel', False):
             return num_heads
         sp_size = parallel_config.ulysses_sequence_parallel_size
         return max(1, num_heads // sp_size)
@@ -290,6 +290,11 @@ class UlyssesParallelState(ArcticPatch[parallel_state]):
         parallel_state._SP_TP = _SP_TP
 
         if get_world_group().local_rank == 0:
+            dgp_enabled = bool(
+                getattr(config.parallel_config, "enable_gearing_parallel", False)
+            )
+            dgp_size = _SP.world_size if dgp_enabled else 1
+            dgp_ranks = SP_group_ranks if dgp_enabled else [[rank] for rank in range(world_size)]
             parallel_state.logger.info(
                 "UlyssesParallelState initialized:\n"
                 f"  PP {_PP.world_size} ranks {PP_group_ranks}\n"
@@ -299,7 +304,8 @@ class UlyssesParallelState(ArcticPatch[parallel_state]):
                 f"  SP {_SP.world_size} ranks {SP_group_ranks}\n"
                 f"  DP {_DP.world_size} ranks {DP_group_ranks}\n"
                 f"  EP {_EP.world_size} ranks {EP_group_ranks}\n"
-                f"  SP_TP {_SP_TP.world_size} ranks {SP_TP_group_ranks}"
+                f"  SP_TP {_SP_TP.world_size} ranks {SP_TP_group_ranks}\n"
+                f"  DGP {dgp_size} ranks {dgp_ranks}"
             )
 
         num_kv_heads = config.model_config._orig_get_num_kv_heads(config.parallel_config)
@@ -351,6 +357,15 @@ class UlyssesWorkerProc(ArcticPatch[WorkerProc]):
 
 
 class UlyssesMultiprocExecutor(ArcticPatch[MultiprocExecutor]):
+
+    class _CPAllDPOutputAggregator:
+
+        def __init__(self, merge_fn: Callable[[list[Any]], Any]):
+            self._merge_fn = merge_fn
+
+        def aggregate(self, responses: list[Any], output_rank: int = 0) -> Any:
+            # signature matches KVOutputAggregator.aggregate(...)
+            return self._merge_fn(responses)
 
     def _init_executor(self) -> None:
         # Call self.shutdown at exit to clean up
@@ -475,6 +490,120 @@ class UlyssesMultiprocExecutor(ArcticPatch[MultiprocExecutor]):
 
         self.output_rank = self._get_output_rank()
 
+    def _merge_cp_outputs(
+        self, outputs: list[ModelRunnerOutput | None]
+    ) -> ModelRunnerOutput | None:
+        non_null_outputs = [out for out in outputs if out is not None]
+        if not non_null_outputs:
+            return None
+        if len(non_null_outputs) == 1:
+            return non_null_outputs[0]
+
+        merged_req_ids: list[str] = []
+        merged_sampled_token_ids: list[list[int]] = []
+        merged_logprobs: list[Any] = []
+        merged_prompt_logprobs: dict[str, Any] = {}
+        merged_req_id_to_index: dict[str, int] = {}
+        merged_num_nans_in_logits: dict[str, int] = {}
+        merged_actual_draft_lens: dict[str, int] = {}
+
+        first_output = non_null_outputs[0]
+        pooler_output = first_output.pooler_output
+        kv_connector_output = first_output.kv_connector_output
+        ec_connector_output = first_output.ec_connector_output
+        cudagraph_stats = first_output.cudagraph_stats
+
+        for out in non_null_outputs:
+            req_ids = list(out.req_ids or [])
+            sampled_token_ids = list(out.sampled_token_ids or [])
+            logprobs = list(out.logprobs or [])
+
+            for idx, req_id in enumerate(req_ids):
+                merged_req_id_to_index[req_id] = len(merged_req_ids)
+                merged_req_ids.append(req_id)
+                merged_sampled_token_ids.append(
+                    sampled_token_ids[idx] if idx < len(sampled_token_ids) else []
+                )
+                merged_logprobs.append(logprobs[idx] if idx < len(logprobs) else None)
+
+            if out.prompt_logprobs_dict:
+                merged_prompt_logprobs.update(out.prompt_logprobs_dict)
+
+            if out.num_nans_in_logits:
+                for req_id, num_nans in out.num_nans_in_logits.items():
+                    merged_num_nans_in_logits[req_id] = (
+                        merged_num_nans_in_logits.get(req_id, 0) + int(num_nans)
+                    )
+
+            draft_lens = getattr(out, "_actual_draft_lens", None)
+            if isinstance(draft_lens, dict):
+                merged_actual_draft_lens.update(draft_lens)
+
+        merged = ModelRunnerOutput(
+            req_ids=merged_req_ids,
+            req_id_to_index=merged_req_id_to_index,
+            sampled_token_ids=merged_sampled_token_ids,
+            logprobs=merged_logprobs,
+            prompt_logprobs_dict=merged_prompt_logprobs,
+            pooler_output=pooler_output,
+            kv_connector_output=kv_connector_output,
+            ec_connector_output=ec_connector_output,
+            num_nans_in_logits=(merged_num_nans_in_logits
+                                if merged_num_nans_in_logits else None),
+            cudagraph_stats=cudagraph_stats,
+        )
+        if merged_actual_draft_lens:
+            merged._actual_draft_lens = merged_actual_draft_lens
+        return merged
+
+    def execute_model(  # type: ignore[override]
+        self, scheduler_output, non_block: bool = False
+    ):
+        dgp_mode = bool(getattr(self.parallel_config, "enable_gearing_parallel", False))
+        if not dgp_mode:
+            return self.collective_rpc(
+                "execute_model",
+                args=(scheduler_output,),
+                unique_reply_rank=self.output_rank,
+                non_block=non_block,
+                timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
+                kv_output_aggregator=self.kv_output_aggregator,
+            )
+
+        aggregator = self._CPAllDPOutputAggregator(self._merge_cp_outputs)
+        return self.collective_rpc(
+            "execute_model",
+            args=(scheduler_output,),
+            unique_reply_rank=None,
+            non_block=non_block,
+            timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
+            kv_output_aggregator=aggregator,
+        )
+
+    def sample_tokens(  # type: ignore[override]
+        self, grammar_output, non_block: bool = False
+    ):
+        dgp_mode = bool(getattr(self.parallel_config, "enable_gearing_parallel", False))
+        if not dgp_mode:
+            return self.collective_rpc(
+                "sample_tokens",
+                args=(grammar_output,),
+                unique_reply_rank=self.output_rank,
+                non_block=non_block,
+                timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
+                kv_output_aggregator=self.kv_output_aggregator,
+            )
+
+        aggregator = self._CPAllDPOutputAggregator(self._merge_cp_outputs)
+        return self.collective_rpc(
+            "sample_tokens",
+            args=(grammar_output,),
+            unique_reply_rank=None,
+            non_block=non_block,
+            timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
+            kv_output_aggregator=aggregator,
+        )
+
 
 class UlyssesAttention(ArcticPatch[Attention]):
 
@@ -487,9 +616,9 @@ class UlyssesAttention(ArcticPatch[Attention]):
         config = get_current_vllm_config()
         self.sp_size = parallel_state._SP.world_size
         self.sp_device_group = parallel_state._SP.device_group
-        self.enable_context_parallel = getattr(
-            config.parallel_config, 'enable_context_parallel', False)
-        if not self.enable_context_parallel and not is_shift_parallel_mode():
+        self.enable_gearing_parallel = getattr(
+            config.parallel_config, 'enable_gearing_parallel', False)
+        if not self.enable_gearing_parallel and not is_shift_parallel_mode():
             num_heads //= self.sp_size
             num_kv_heads = kwargs["num_kv_heads"]
             self.is_kv_replicated = True if num_kv_heads < self.sp_size else False
@@ -504,7 +633,7 @@ class UlyssesAttention(ArcticPatch[Attention]):
     def forward(self, query, key, value, **kwargs):
         from .model_runner import is_shift_parallel_mode
         if (self.sp_size == 1 or is_shift_parallel_mode()
-                or self.enable_context_parallel):
+                or self.enable_gearing_parallel):
             return self._orig_forward(query, key, value, **kwargs)
 
         # prepare

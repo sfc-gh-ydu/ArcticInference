@@ -31,17 +31,17 @@ class ArcticParallelConfig(ParallelConfig):
     ulysses_sequence_parallel_size: int = 1
     enable_shift_parallel: bool = False
     shift_parallel_threshold: int = 512
-    enable_context_parallel: bool = False
+    enable_gearing_parallel: bool = False
 
     def __post_init__(self, *args, **kwargs):
         if (self.enable_shift_parallel
                 and self.ulysses_sequence_parallel_size == 1):
             raise ValueError("ulysses_sequence_parallel_size must be > 1 "
                              "when enable_shift_parallel is True.")
-        if (self.enable_context_parallel
+        if (self.enable_gearing_parallel
                 and self.ulysses_sequence_parallel_size == 1):
             raise ValueError("ulysses_sequence_parallel_size must be > 1 "
-                             "when enable_context_parallel is True.")
+                             "when enable_gearing_parallel is True.")
         super().__post_init__(*args, **kwargs)
 
     @property
@@ -56,6 +56,12 @@ class ArcticParallelConfig(ParallelConfig):
         # a property with a no-op setter to ignore the value later assigned by
         # ParallelConfig.__post_init__.
         pass
+
+    @property
+    def gearing_parallel_size(self) -> int:
+        # In Arctic, enable_gearing_parallel means all SP workers act as
+        # independent DP workers (full model per rank, request sharding).
+        return self.ulysses_sequence_parallel_size if self.enable_gearing_parallel else 1
 
 
 @dataclass
@@ -150,7 +156,7 @@ class VllmConfigPatch(ArcticPatch[VllmConfig]):
         string += f", ulysses_sequence_parallel_size={self.parallel_config.ulysses_sequence_parallel_size}"
         string += f", enable_shift_parallel={self.parallel_config.enable_shift_parallel}"
         string += f", shift_parallel_threshold={self.parallel_config.shift_parallel_threshold}"
-        string += f", enable_context_parallel={self.parallel_config.enable_context_parallel}"
+        string += f", enable_gearing_parallel={self.parallel_config.enable_gearing_parallel}"
         return string
 
     def __post_init__(self, *args, **kwargs):

@@ -144,6 +144,21 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
 
         self._orig_init(vllm_config, device)
 
+        self.cp_all_dp_enabled = bool(
+            getattr(vllm_config.parallel_config, "enable_gearing_parallel", False)
+            and getattr(vllm_config.parallel_config, "ulysses_sequence_parallel_size", 1) > 1
+        )
+        sp_group = getattr(parallel_state, "_SP", None)
+        self.cp_all_dp_size = int(
+            sp_group.world_size
+            if sp_group is not None
+            else getattr(vllm_config.parallel_config, "ulysses_sequence_parallel_size", 1)
+        )
+        self.cp_all_dp_rank = int(
+            sp_group.rank_in_group if sp_group is not None else 0
+        )
+        self._cp_all_dp_owned_req_ids: set[str] = set()
+
         self._suffix_cache: Optional[SuffixDecodingCache] = None
         
         if is_arctic_spec:
@@ -372,6 +387,11 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         """
         Slice the batch across Ulysses SP ranks for forward, then all-gather.
         """
+        if getattr(self.parallel_config, "enable_gearing_parallel", False):
+            # DGP mode uses request sharding in scheduler output filtering.
+            # Do not apply Ulysses token slicing/all-gather in forward path.
+            return
+
         sp_size = parallel_state._SP.world_size
         sp_rank = parallel_state._SP.rank_in_group
         device_group = parallel_state._SP.device_group
@@ -386,7 +406,13 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             N_ulysses = N // sp_size
             N_offset = N_ulysses * sp_rank
 
-            if torch.distributed.get_rank() == 0:
+            if getattr(self.parallel_config, "enable_gearing_parallel", False):
+                print(
+                    f"[DGP rank {sp_rank}/{sp_size}] "
+                    f"N {N}, N_ulysses {N_ulysses}, "
+                    f"slice=[{N_offset}:{N_offset + N_ulysses}]"
+                )
+            elif torch.distributed.get_rank() == 0:
                 print(f"N {N}, N_ulysses {N_ulysses}")
 
             kwargs[input_key] = input_tensor[N_offset:N_offset + N_ulysses]
@@ -611,6 +637,9 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
     ) -> Union[
         ModelRunnerOutput, AsyncGPUModelRunnerOutput, IntermediateTensors
     ]:
+        if self.cp_all_dp_enabled:
+            scheduler_output = self._filter_scheduler_output_for_cp_dp(scheduler_output)
+
         num_scheduled_tokens = getattr(scheduler_output, "total_num_scheduled_tokens", None)
         if num_scheduled_tokens is None:
             try:
@@ -637,6 +666,199 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 return self._orig_execute_model(scheduler_output, intermediate_tensors)
         finally:
             self.model = orig_model
+
+    def _cp_req_assigned_to_rank(self, req_id: str) -> bool:
+        return (hash(req_id) % self.cp_all_dp_size) == self.cp_all_dp_rank
+
+    def _filter_scheduler_output_for_cp_dp(self, scheduler_output: "SchedulerOutput"):
+        if self.cp_all_dp_size <= 1:
+            return scheduler_output
+
+        out = copy.copy(scheduler_output)
+
+        def _req_id(entry):
+            return getattr(entry, "req_id", None)
+
+        def _filter_entries(entries):
+            filtered = []
+            for entry in entries:
+                req_id = _req_id(entry)
+                # Keep entries without req_id to avoid dropping control payloads.
+                if req_id is None or self._cp_req_assigned_to_rank(req_id):
+                    filtered.append(entry)
+            return filtered
+
+        def dgp_find_indices(req_ids: list[str]) -> list[int]:
+            return [
+                i for i, req_id in enumerate(req_ids)
+                if self._cp_req_assigned_to_rank(req_id)
+            ]
+
+        def _safe_project_list(values, indices: list[int], source_len: int):
+            # Some CachedRequestData fields are optional/PP-specific and may not
+            # align in length with req_ids. Only index when lengths match.
+            if not isinstance(values, list):
+                return values
+            if len(values) == 0:
+                return []
+            if len(values) != source_len:
+                return []
+            return [values[i] for i in indices]
+
+        def _filter_cached_reqs(cached_reqs):
+            # vLLM v1 uses CachedRequestData (parallel arrays), not a list.
+            if hasattr(cached_reqs, "req_ids"):
+                req_ids = list(getattr(cached_reqs, "req_ids", []))
+                keep_indices = dgp_find_indices(req_ids)
+                kept_req_ids = [req_ids[i] for i in keep_indices]
+                kept_req_id_set = set(kept_req_ids)
+
+                filtered = copy.copy(cached_reqs)
+                filtered.req_ids = kept_req_ids
+                filtered.resumed_req_ids = set(
+                    req_id for req_id in getattr(cached_reqs, "resumed_req_ids", set())
+                    if req_id in kept_req_id_set
+                )
+                filtered.new_token_ids = _safe_project_list(
+                    getattr(cached_reqs, "new_token_ids", []),
+                    keep_indices,
+                    len(req_ids),
+                )
+                filtered.new_block_ids = _safe_project_list(
+                    getattr(cached_reqs, "new_block_ids", []),
+                    keep_indices,
+                    len(req_ids),
+                )
+                filtered.num_computed_tokens = _safe_project_list(
+                    getattr(cached_reqs, "num_computed_tokens", []),
+                    keep_indices,
+                    len(req_ids),
+                )
+                filtered.num_output_tokens = _safe_project_list(
+                    getattr(cached_reqs, "num_output_tokens", []),
+                    keep_indices,
+                    len(req_ids),
+                )
+                filtered.all_token_ids = {
+                    req_id: token_ids
+                    for req_id, token_ids in getattr(cached_reqs, "all_token_ids", {}).items()
+                    if req_id in kept_req_id_set
+                }
+                return filtered
+
+            # Backward/alternate shape fallback: treat as entry list.
+            return _filter_entries(cached_reqs or [])
+
+        new_reqs = _filter_entries(getattr(scheduler_output, "scheduled_new_reqs", []))
+        cached_reqs = _filter_cached_reqs(
+            getattr(scheduler_output, "scheduled_cached_reqs", [])
+        )
+
+        setattr(out, "scheduled_new_reqs", new_reqs)
+        setattr(out, "scheduled_cached_reqs", cached_reqs)
+        running_reqs = []
+        if hasattr(scheduler_output, "scheduled_running_reqs"):
+            running_reqs = _filter_entries(
+                getattr(scheduler_output, "scheduled_running_reqs", [])
+            )
+        if hasattr(out, "scheduled_running_reqs"):
+            setattr(out, "scheduled_running_reqs", running_reqs)
+
+        cached_req_ids = (
+            list(getattr(cached_reqs, "req_ids", []))
+            if hasattr(cached_reqs, "req_ids")
+            else [_req_id(e) for e in cached_reqs]
+        )
+        owned_now = {
+            rid for rid in [
+                *[_req_id(e) for e in new_reqs],
+                *cached_req_ids,
+                *[_req_id(e) for e in running_reqs],
+            ] if rid is not None
+        }
+        self._cp_all_dp_owned_req_ids.update(owned_now)
+
+        num_scheduled_tokens = dict(getattr(scheduler_output, "num_scheduled_tokens", {}))
+        filtered_num_scheduled_tokens = {
+            req_id: num_tokens
+            for req_id, num_tokens in num_scheduled_tokens.items()
+            if self._cp_req_assigned_to_rank(req_id)
+        }
+        setattr(out, "num_scheduled_tokens", filtered_num_scheduled_tokens)
+        setattr(
+            out,
+            "total_num_scheduled_tokens",
+            int(sum(filtered_num_scheduled_tokens.values())),
+        )
+
+        finished_req_ids = list(getattr(scheduler_output, "finished_req_ids", []))
+        filtered_finished_req_ids = [
+            req_id for req_id in finished_req_ids
+            if (req_id in self._cp_all_dp_owned_req_ids
+                or self._cp_req_assigned_to_rank(req_id))
+        ]
+        self._cp_all_dp_owned_req_ids.difference_update(filtered_finished_req_ids)
+        setattr(out, "finished_req_ids", filtered_finished_req_ids)
+
+        scheduled_spec_decode_tokens = dict(
+            getattr(scheduler_output, "scheduled_spec_decode_tokens", {})
+        )
+        setattr(
+            out,
+            "scheduled_spec_decode_tokens",
+            {
+                req_id: tokens
+                for req_id, tokens in scheduled_spec_decode_tokens.items()
+                if req_id in filtered_num_scheduled_tokens
+            },
+        )
+
+        scheduled_encoder_inputs = dict(
+            getattr(scheduler_output, "scheduled_encoder_inputs", {})
+        )
+        setattr(
+            out,
+            "scheduled_encoder_inputs",
+            {
+                req_id: encoder_inputs
+                for req_id, encoder_inputs in scheduled_encoder_inputs.items()
+                if req_id in filtered_num_scheduled_tokens
+            },
+        )
+
+        pending_structured = getattr(
+            scheduler_output, "pending_structured_output_tokens", None
+        )
+        if isinstance(pending_structured, dict):
+            setattr(
+                out,
+                "pending_structured_output_tokens",
+                {
+                    req_id: token
+                    for req_id, token in pending_structured.items()
+                    if req_id in filtered_num_scheduled_tokens
+                },
+            )
+
+        preempted_req_ids_val = getattr(scheduler_output, "preempted_req_ids", [])
+        preempted_req_ids = list(preempted_req_ids_val or [])
+        setattr(
+            out,
+            "preempted_req_ids",
+            [
+                req_id for req_id in preempted_req_ids
+                if req_id in filtered_num_scheduled_tokens
+            ],
+        )
+
+        print(
+            f"[DGP rank {self.cp_all_dp_rank}/{self.cp_all_dp_size}] "
+            f"scheduled_reqs={len(filtered_num_scheduled_tokens)}, "
+            f"scheduled_tokens={int(sum(filtered_num_scheduled_tokens.values()))}, "
+            f"finished_reqs={len(filtered_finished_req_ids)}"
+        )
+
+        return out
 
     @torch.inference_mode
     def sample_tokens(self, grammar_output):
@@ -1613,7 +1835,8 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
 
         self._orig_load_model(eep_scale_up)
 
-        if self.parallel_config.ulysses_sequence_parallel_size > 1:
+        if (self.parallel_config.ulysses_sequence_parallel_size > 1
+                and not getattr(self.parallel_config, "enable_gearing_parallel", False)):
             self.monkeypatch_forward()
 
         if load_shift_model:
