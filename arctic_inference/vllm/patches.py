@@ -50,6 +50,135 @@ class AsyncSchedulerPatch(ArcticPatch[AsyncScheduler]):
 
     _orig_update_after_schedule = AsyncScheduler._update_after_schedule
 
+    @staticmethod
+    def _is_dgp_enabled(scheduler: AsyncScheduler) -> bool:
+        pc = getattr(scheduler.vllm_config, "parallel_config", None)
+        return bool(
+            getattr(pc, "enable_gearing_parallel", False)
+            and int(getattr(pc, "ulysses_sequence_parallel_size", 1)) > 1
+        )
+
+    @staticmethod
+    def _ensure_dgp_routing_state(scheduler: AsyncScheduler) -> None:
+        if not hasattr(scheduler, "data_gearing_parallel_map"):
+            scheduler.data_gearing_parallel_map = {}
+        if not hasattr(scheduler, "data_gearing_req_to_group"):
+            scheduler.data_gearing_req_to_group = {}
+        if not hasattr(scheduler, "_data_gearing_group_refcount"):
+            scheduler._data_gearing_group_refcount = {}
+        if not hasattr(scheduler, "_data_gearing_next_rank"):
+            scheduler._data_gearing_next_rank = 0
+
+    @staticmethod
+    def _extract_req_id(entry) -> str | None:
+        return getattr(entry, "req_id", None)
+
+    @staticmethod
+    def _iter_scheduled_req_ids(scheduler_output) -> list[str]:
+        req_ids: set[str] = set()
+        req_ids.update(
+            str(req_id)
+            for req_id in getattr(scheduler_output, "num_scheduled_tokens", {}).keys()
+        )
+        for entry in getattr(scheduler_output, "scheduled_new_reqs", []) or []:
+            req_id = AsyncSchedulerPatch._extract_req_id(entry)
+            if req_id is not None:
+                req_ids.add(str(req_id))
+        cached_reqs = getattr(scheduler_output, "scheduled_cached_reqs", None)
+        if cached_reqs is not None:
+            if hasattr(cached_reqs, "req_ids"):
+                req_ids.update(str(req_id) for req_id in getattr(cached_reqs, "req_ids", []))
+            else:
+                for entry in cached_reqs or []:
+                    req_id = AsyncSchedulerPatch._extract_req_id(entry)
+                    if req_id is not None:
+                        req_ids.add(str(req_id))
+        for entry in getattr(scheduler_output, "scheduled_running_reqs", []) or []:
+            req_id = AsyncSchedulerPatch._extract_req_id(entry)
+            if req_id is not None:
+                req_ids.add(str(req_id))
+        return list(req_ids)
+
+    @staticmethod
+    def _compute_prompt_group_key(request) -> tuple[int, ...]:
+        num_prompt_tokens = int(getattr(request, "num_prompt_tokens", 0) or 0)
+        if num_prompt_tokens > 0 and hasattr(request, "get_token_id"):
+            return tuple(int(request.get_token_id(i)) for i in range(num_prompt_tokens))
+
+        token_ids = getattr(request, "prompt_token_ids", None)
+        if token_ids is None:
+            token_ids = getattr(request, "all_token_ids", None)
+            if token_ids is not None and num_prompt_tokens > 0:
+                token_ids = token_ids[:num_prompt_tokens]
+        if token_ids is None:
+            raise RuntimeError(
+                "DGP routing requires prompt token IDs to compute PromptGroupKey."
+            )
+
+        if hasattr(token_ids, "tolist"):
+            token_ids = token_ids.tolist()
+        if isinstance(token_ids, tuple):
+            token_ids = list(token_ids)
+        elif not isinstance(token_ids, list):
+            token_ids = list(token_ids)
+
+        if num_prompt_tokens > 0:
+            token_ids = token_ids[:num_prompt_tokens]
+        if len(token_ids) == 0:
+            raise RuntimeError(
+                "DGP routing encountered empty prompt token IDs for PromptGroupKey."
+            )
+        return tuple(int(token_id) for token_id in token_ids)
+
+    @staticmethod
+    def _assign_group_owner_rank(scheduler: AsyncScheduler, group_key: tuple[int, ...]) -> int:
+        owner = scheduler.data_gearing_parallel_map.get(group_key)
+        if owner is not None:
+            return int(owner)
+        pc = scheduler.vllm_config.parallel_config
+        group_size = max(1, int(getattr(pc, "ulysses_sequence_parallel_size", 1)))
+        owner = int(scheduler._data_gearing_next_rank % group_size)
+        scheduler._data_gearing_next_rank = owner + 1
+        scheduler.data_gearing_parallel_map[group_key] = owner
+        return owner
+
+    @staticmethod
+    def _build_req_owner_rank(scheduler: AsyncScheduler, scheduler_output) -> dict[str, int]:
+        AsyncSchedulerPatch._ensure_dgp_routing_state(scheduler)
+        req_owner_rank: dict[str, int] = {}
+        for req_id in AsyncSchedulerPatch._iter_scheduled_req_ids(scheduler_output):
+            request = scheduler.requests.get(req_id)
+            if request is None:
+                raise RuntimeError(
+                    f"DGP routing missing request state for req_id={req_id}."
+                )
+            group_key = scheduler.data_gearing_req_to_group.get(req_id)
+            if group_key is None:
+                group_key = AsyncSchedulerPatch._compute_prompt_group_key(request)
+                scheduler.data_gearing_req_to_group[req_id] = group_key
+                scheduler._data_gearing_group_refcount[group_key] = (
+                    scheduler._data_gearing_group_refcount.get(group_key, 0) + 1
+                )
+            owner_rank = AsyncSchedulerPatch._assign_group_owner_rank(scheduler, group_key)
+            req_owner_rank[req_id] = owner_rank
+        return req_owner_rank
+
+    @staticmethod
+    def _cleanup_finished_routing_state(scheduler: AsyncScheduler, scheduler_output) -> None:
+        if not AsyncSchedulerPatch._is_dgp_enabled(scheduler):
+            return
+        AsyncSchedulerPatch._ensure_dgp_routing_state(scheduler)
+        for req_id in getattr(scheduler_output, "finished_req_ids", []) or []:
+            group_key = scheduler.data_gearing_req_to_group.pop(req_id, None)
+            if group_key is None:
+                continue
+            remaining = int(scheduler._data_gearing_group_refcount.get(group_key, 0)) - 1
+            if remaining <= 0:
+                scheduler._data_gearing_group_refcount.pop(group_key, None)
+                scheduler.data_gearing_parallel_map.pop(group_key, None)
+            else:
+                scheduler._data_gearing_group_refcount[group_key] = remaining
+
     def _update_after_schedule(self, scheduler_output):
         # Call the base Scheduler._update_after_schedule (NOT the
         # AsyncScheduler override which we are replacing).
@@ -118,6 +247,12 @@ class AsyncSchedulerPatch(ArcticPatch[AsyncScheduler]):
         scheduler_output.pending_structured_output_tokens = (
             pending_structured_output_tokens)
 
+        if AsyncSchedulerPatch._is_dgp_enabled(self):
+            req_owner_rank = AsyncSchedulerPatch._build_req_owner_rank(
+                self, scheduler_output
+            )
+            setattr(scheduler_output, "req_owner_rank", req_owner_rank)
+
     def update_from_output(self, scheduler_output, model_runner_output):
         """Wrap Scheduler.update_from_output to store actual draft counts.
 
@@ -145,6 +280,7 @@ class AsyncSchedulerPatch(ArcticPatch[AsyncScheduler]):
 
         result = Scheduler.update_from_output(
             self, scheduler_output, model_runner_output)
+        AsyncSchedulerPatch._cleanup_finished_routing_state(self, scheduler_output)
 
         # Primary path: read from model_runner_output (most reliable
         # for async scheduling — the ModelRunnerOutput object is

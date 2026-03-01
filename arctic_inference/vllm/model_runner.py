@@ -638,7 +638,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         ModelRunnerOutput, AsyncGPUModelRunnerOutput, IntermediateTensors
     ]:
         if self.cp_all_dp_enabled:
-            scheduler_output = self._filter_scheduler_output_for_cp_dp(scheduler_output)
+            scheduler_output = self._filter_scheduler_output_for_gp_dp(scheduler_output)
 
         num_scheduled_tokens = getattr(scheduler_output, "total_num_scheduled_tokens", None)
         if num_scheduled_tokens is None:
@@ -667,31 +667,84 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         finally:
             self.model = orig_model
 
-    def _cp_req_assigned_to_rank(self, req_id: str) -> bool:
-        return (hash(req_id) % self.cp_all_dp_size) == self.cp_all_dp_rank
+    def _gp_req_assigned_to_rank(self, req_id: str, req_owner_rank: dict[str, int]) -> bool:
+        if req_id not in req_owner_rank:
+            raise RuntimeError(
+                f"DGP req_owner_rank missing owner for req_id={req_id} on "
+                f"rank {self.cp_all_dp_rank}/{self.cp_all_dp_size}."
+            )
+        return int(req_owner_rank[req_id]) == self.cp_all_dp_rank
 
-    def _filter_scheduler_output_for_cp_dp(self, scheduler_output: "SchedulerOutput"):
+    def _filter_scheduler_output_for_gp_dp(self, scheduler_output: "SchedulerOutput"):
         if self.cp_all_dp_size <= 1:
             return scheduler_output
+
+        req_owner_rank = getattr(scheduler_output, "req_owner_rank", None)
+        if not isinstance(req_owner_rank, dict):
+            raise RuntimeError(
+                "DGP mode requires scheduler_output.req_owner_rank to be "
+                "present as dict[req_id, owner_rank]."
+            )
 
         out = copy.copy(scheduler_output)
 
         def _req_id(entry):
             return getattr(entry, "req_id", None)
 
+        def _collect_scheduled_req_ids() -> set[str]:
+            req_ids: set[str] = set()
+            req_ids.update(
+                str(req_id)
+                for req_id in getattr(scheduler_output, "num_scheduled_tokens", {}).keys()
+            )
+            for entry in getattr(scheduler_output, "scheduled_new_reqs", []) or []:
+                req_id = _req_id(entry)
+                if req_id is not None:
+                    req_ids.add(str(req_id))
+            cached_reqs = getattr(scheduler_output, "scheduled_cached_reqs", None)
+            if cached_reqs is not None:
+                if hasattr(cached_reqs, "req_ids"):
+                    req_ids.update(
+                        str(req_id)
+                        for req_id in getattr(cached_reqs, "req_ids", [])
+                    )
+                else:
+                    for entry in cached_reqs or []:
+                        req_id = _req_id(entry)
+                        if req_id is not None:
+                            req_ids.add(str(req_id))
+            for entry in getattr(scheduler_output, "scheduled_running_reqs", []) or []:
+                req_id = _req_id(entry)
+                if req_id is not None:
+                    req_ids.add(str(req_id))
+            return req_ids
+
+        missing_owners = sorted(
+            req_id for req_id in _collect_scheduled_req_ids()
+            if req_id not in req_owner_rank
+        )
+        if missing_owners:
+            preview = ", ".join(missing_owners[:8])
+            raise RuntimeError(
+                "DGP req_owner_rank missing scheduled request ownership for "
+                f"{len(missing_owners)} reqs (first: {preview})."
+            )
+
         def _filter_entries(entries):
             filtered = []
             for entry in entries:
                 req_id = _req_id(entry)
                 # Keep entries without req_id to avoid dropping control payloads.
-                if req_id is None or self._cp_req_assigned_to_rank(req_id):
+                if req_id is None or self._gp_req_assigned_to_rank(
+                    str(req_id), req_owner_rank
+                ):
                     filtered.append(entry)
             return filtered
 
         def dgp_find_indices(req_ids: list[str]) -> list[int]:
             return [
                 i for i, req_id in enumerate(req_ids)
-                if self._cp_req_assigned_to_rank(req_id)
+                if self._gp_req_assigned_to_rank(str(req_id), req_owner_rank)
             ]
 
         def _safe_project_list(values, indices: list[int], source_len: int):
@@ -782,7 +835,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         filtered_num_scheduled_tokens = {
             req_id: num_tokens
             for req_id, num_tokens in num_scheduled_tokens.items()
-            if self._cp_req_assigned_to_rank(req_id)
+            if self._gp_req_assigned_to_rank(str(req_id), req_owner_rank)
         }
         setattr(out, "num_scheduled_tokens", filtered_num_scheduled_tokens)
         setattr(
@@ -794,8 +847,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         finished_req_ids = list(getattr(scheduler_output, "finished_req_ids", []))
         filtered_finished_req_ids = [
             req_id for req_id in finished_req_ids
-            if (req_id in self._cp_all_dp_owned_req_ids
-                or self._cp_req_assigned_to_rank(req_id))
+            if req_id in self._cp_all_dp_owned_req_ids
         ]
         self._cp_all_dp_owned_req_ids.difference_update(filtered_finished_req_ids)
         setattr(out, "finished_req_ids", filtered_finished_req_ids)
